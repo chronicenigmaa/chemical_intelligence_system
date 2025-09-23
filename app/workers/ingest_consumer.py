@@ -21,6 +21,9 @@ from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import text, bindparam, Integer, String
+from sqlalchemy.dialects.postgresql import JSONB, insert as pg_insert
+
 
 from app.core.config import settings
 from app.core.json_sanitize import sanitize_json
@@ -59,43 +62,50 @@ import json, traceback
 async def persist_and_link(query: str, chosen: dict | None, source_item_id: int | None) -> bool:
     if not chosen or not chosen.get("CID"):
         return False
+
     chosen = sanitize_json(chosen)
     cid = str(chosen["CID"])
 
     async with AsyncSessionLocal() as s:
         try:
-            # --- UPSERT scraped_compounds (relies on JSONB column in your model) ---
+            # --- UPSERT scraped_compounds on (source, external_id) ---
             table = ScrapedCompound.__table__
             stmt = pg_insert(table).values(
                 query=query, source="pubchem", external_id=cid, properties=chosen
             ).on_conflict_do_update(
+                # use your constraint name if you created it (safer)
+                # constraint="uq_scraped_source_ext",
                 index_elements=[table.c.source, table.c.external_id],
                 set_={"query": query, "properties": chosen}
             )
             await s.execute(stmt)
 
-            # --- UPSERT product_chem_xref; cast JSON explicitly to jsonb ---
+            # --- UPSERT product_chem_xref using TYPED bindparams (no literal ::jsonb) ---
             if source_item_id:
-                await s.execute(
-                    text("""
-                        insert into product_chem_xref
-                          (product_id, source, external_id, cas, match_confidence, properties_ref)
-                        values
-                          (:pid, 'pubchem', :cid, null, 0.95, :props::jsonb)
-                        on conflict (source, external_id, product_id) do update
-                          set properties_ref = excluded.properties_ref,
-                              updated_at = now()
-                    """),
-                    {"pid": source_item_id, "cid": cid, "props": json.dumps(chosen)}
+                upsert_xref = text("""
+                    INSERT INTO product_chem_xref
+                        (product_id, source, external_id, cas, match_confidence, properties_ref)
+                    VALUES
+                        (:pid, 'pubchem', :cid, NULL, 0.95, :props)
+                    ON CONFLICT ON CONSTRAINT uq_xref_source_ext_prod DO UPDATE
+                        SET properties_ref = EXCLUDED.properties_ref,
+                            updated_at = now()
+                """).bindparams(
+                    bindparam("pid",  type_=Integer),
+                    bindparam("cid",  type_=String),
+                    bindparam("props", type_=JSONB)  # <-- JSONB typed bind
                 )
+                await s.execute(upsert_xref, {"pid": source_item_id, "cid": cid, "props": chosen})
 
             await s.commit()
             return True
 
         except Exception:
             await s.rollback()
-            print("[persist_and_link] ERROR\n", traceback.format_exc())
+            import traceback; print("[persist_and_link] ERROR\n", traceback.format_exc())
             return False
+
+
 # --- Worker loop ---
 async def run_worker() -> None:
     consumer = AIOKafkaConsumer(
