@@ -1,0 +1,26 @@
+version: "3.8"
+services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v23.3.14
+    command:
+      - redpanda start
+      - --overprovisioned
+      - --smp=1
+      - --memory=1G
+      - --reserve-memory=0M
+      - --node-id=0
+      - --check=false
+      - --set redpanda.enable_idempotence=true
+    ports:
+      - "9092:9092"   # Kafka API
+      - "9644:9644"   # Admin API
+    environment:
+      - KAFKA_AUTO_CREATE_TOPICS_ENABLE=false
+  console:
+    image: docker.redpanda.com/redpandadata/console:latest
+    ports:
+      - "8080:8080"
+    environment:
+      - KAFKA_BROKERS=redpanda:9092
+    depends_on:
+      - redpanda
