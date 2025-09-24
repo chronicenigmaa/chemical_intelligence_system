@@ -10,6 +10,7 @@ import pdfplumber
 from pdf2image import convert_from_path
 import pytesseract
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
 
 # ------------- config / db engine -------------
 def get_engine():
@@ -33,7 +34,7 @@ CREATE EXTENSION IF NOT EXISTS pg_trgm;
 -- main docs
 CREATE TABLE IF NOT EXISTS sds_document(
   id             bigserial PRIMARY KEY,
-  product_id     bigint NULL, -- soft ref to item_master_clean(source_item_id)
+  product_id     bigint NULL,
   title          text,
   filename       text NOT NULL,
   file_sha256    text NOT NULL,
@@ -64,7 +65,7 @@ CREATE TABLE IF NOT EXISTS sds_section(
   PRIMARY KEY (doc_id, section_no)
 );
 
--- parsed entities (dedup via unique constraint)
+-- parsed entities (dedup via unique index)
 CREATE TABLE IF NOT EXISTS sds_entity(
   id           bigserial PRIMARY KEY,
   doc_id       bigint NOT NULL REFERENCES sds_document(id) ON DELETE CASCADE,
@@ -76,25 +77,36 @@ CREATE TABLE IF NOT EXISTS sds_entity(
   chem_id      bigint NULL,
   created_at   timestamptz DEFAULT now()
 );
-CREATE UNIQUE INDEX IF NOT EXISTS uq_sds_entity_doc_type_val
-  ON sds_entity(doc_id, entity_type, norm_value)
-  WHERE norm_value IS NOT NULL;
 
--- Section 3 components (store normalized keys for uniqueness)
+-- Replace any partial index with a non-partial one to support ON CONFLICT (cols...)
+DROP INDEX IF EXISTS uq_sds_entity_doc_type_val;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_sds_entity_doc_type_val
+  ON sds_entity(doc_id, entity_type, norm_value);
+
+-- Section 3 components (do NOT assume column flavor; runtime handles generated/plain)
 CREATE TABLE IF NOT EXISTS sds_component(
   id          bigserial PRIMARY KEY,
   doc_id      bigint NOT NULL REFERENCES sds_document(id) ON DELETE CASCADE,
   page_no     int,
   name        text,
   cas         text,
-  cas_norm    text NOT NULL DEFAULT '',
-  name_key    text NOT NULL DEFAULT '',
+  cas_norm    text,  -- if it already exists as GENERATED in your DB, this line is ignored
+  name_key    text,
   conc_low    numeric,
   conc_high   numeric,
   conc_units  text,
-  created_at  timestamptz DEFAULT now(),
-  UNIQUE (doc_id, cas_norm, name_key)
+  created_at  timestamptz DEFAULT now()
 );
+
+-- Ensure NOT NULL/DEFAULT only when columns exist and are plain; harmless if generated exists
+ALTER TABLE sds_component
+  ALTER COLUMN name_key SET DEFAULT '',
+  ALTER COLUMN name_key DROP NOT NULL,
+  ALTER COLUMN cas_norm DROP NOT NULL;
+
+-- Unique index for dedup
+CREATE UNIQUE INDEX IF NOT EXISTS ux_sds_component_doc_casnorm_namekey
+  ON sds_component (doc_id, cas_norm, name_key);
 
 -- Hazards (H/P codes) — one row per (doc, code)
 CREATE TABLE IF NOT EXISTS sds_hazard(
@@ -131,7 +143,7 @@ BEGIN
   RETURN a||'-'||b||'-'||c;
 END $$;
 
--- pivot view: sections as columns for easy querying
+-- pivot view: sections as columns
 CREATE OR REPLACE VIEW vw_sds_sections_pivot AS
 SELECT
   d.id AS doc_id,
@@ -172,7 +184,7 @@ def sha256_file(p: Path) -> str:
     return h.hexdigest()
 
 def extract_pages(pdf: Path, poppler_path: Optional[str]) -> List[Dict[str, Any]]:
-    pages = []
+    pages: List[Dict[str, Any]] = []
     # Try native text
     with pdfplumber.open(str(pdf)) as doc:
         for i, pg in enumerate(doc.pages, start=1):
@@ -192,7 +204,8 @@ def extract_pages(pdf: Path, poppler_path: Optional[str]) -> List[Dict[str, Any]
     return pages
 
 def parse_conc(line: str):
-    m = re.search(r'(\d+(?:\.\d+)?)\s*(?:-|to|–)\s*(\d+(?:\.\d+)?)\s*%|\b(\d+(?:\.\d+)?)\s*%', line)
+    # matches "10-20 %" or "10 to 20 %" or single "15%"
+    m = re.search(r'(?:(\d+(?:\.\d+)?)\s*(?:-|to|–)\s*(\d+(?:\.\d+)?))\s*%|\b(\d+(?:\.\d+)?)\s*%', line)
     if m:
         if m.group(1) and m.group(2): return float(m.group(1)), float(m.group(2)), '%'
         if m.group(3): v = float(m.group(3)); return v, v, '%'
@@ -201,6 +214,21 @@ def parse_conc(line: str):
 def guess_section_tag(line: str) -> Optional[str]:
     m = re.search(r'\bSECTION\s*\d+\b', line, re.I)
     return m.group(0).upper() if m else None
+
+# ------------- schema introspection -------------
+def is_generated(engine: Engine, table: str, column: str) -> bool:
+    """Return True if the given column is a GENERATED ALWAYS column in the current schema."""
+    q = text("""
+        SELECT is_generated = 'ALWAYS'
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = :t
+          AND column_name = :c
+        LIMIT 1
+    """)
+    with engine.connect() as conn:
+        row = conn.execute(q, {"t": table, "c": column}).scalar()
+    return bool(row)
 
 # ------------- linking SQL -------------
 LINK_SQL = """
@@ -285,18 +313,59 @@ def main():
     args = ap.parse_args()
 
     engine, poppler_path = get_engine()
+    with engine.begin() as c:
+        # Ensure schema (non-destructive)
+        c.execute(text(DDL))
+
+    # Decide which INSERT to use for sds_component based on the actual DB schema
+    use_generated_cas_norm = is_generated(engine, "sds_component", "cas_norm")
+
+    # Statements
+    STMT_ENTITY = text("""
+      INSERT INTO sds_entity(doc_id, page_no, section, entity_type, value, norm_value)
+      VALUES (:doc,:pg,:sec,'CAS',:val, cas_normalize(:val))
+      ON CONFLICT (doc_id, entity_type, norm_value) DO NOTHING;
+    """)
+
+    STMT_COMPONENT_PLAIN = text("""
+      INSERT INTO sds_component (
+        doc_id, page_no, name, cas, cas_norm, name_key, conc_low, conc_high, conc_units
+      )
+      VALUES (
+        :doc, :pg, NULLIF(:name,''), :cas,
+        COALESCE(cas_normalize(:cas),''), lower(coalesce(:name,'')), :lo, :hi, :unit
+      )
+      ON CONFLICT (doc_id, cas_norm, name_key) DO NOTHING;
+    """)
+
+    STMT_COMPONENT_GENERATED = text("""
+      INSERT INTO sds_component (
+        doc_id, page_no, name, cas, name_key, conc_low, conc_high, conc_units
+      )
+      VALUES (
+        :doc, :pg, NULLIF(:name,''), :cas,
+        lower(coalesce(:name,'')), :lo, :hi, :unit
+      )
+      ON CONFLICT (doc_id, cas_norm, name_key) DO NOTHING;
+    """)
+
+    STMT_HAZARD = text("""
+      INSERT INTO sds_hazard(doc_id, page_no, section, code, statement)
+      VALUES (:doc,:pg,:sec,:code,:stmt)
+      ON CONFLICT (doc_id, code) DO UPDATE SET statement = EXCLUDED.statement;
+    """)
+
+    stmt_component = STMT_COMPONENT_GENERATED if use_generated_cas_norm else STMT_COMPONENT_PLAIN
+
     folder = Path(args.dir)
     pdfs = sorted([p for p in folder.glob("*.pdf")])
     if not pdfs:
         print(f"[warn] no PDFs found in {folder}")
         sys.exit(0)
 
-    with engine.begin() as c:
-        # Ensure schema
-        c.execute(text(DDL))
-
-        for pdf in pdfs:
-            digest = sha256_file(pdf)
+    for pdf in pdfs:
+        digest = sha256_file(pdf)
+        with engine.begin() as c:
             # Upsert doc and get id
             doc_id = c.execute(text("""
                 INSERT INTO sds_document(title, filename, file_sha256, pages)
@@ -334,35 +403,27 @@ def main():
 
                     # CAS
                     for cas in CAS_RE.findall(line):
-                        c.execute(text("""
-                          INSERT INTO sds_entity(doc_id, page_no, section, entity_type, value, norm_value)
-                          VALUES (:doc,:pg,:sec,'CAS',:val, cas_normalize(:val))
-                          ON CONFLICT (doc_id, entity_type, norm_value) DO NOTHING;
-                        """), {"doc": doc_id, "pg": page_no, "sec": section, "val": cas})
+                        c.execute(STMT_ENTITY, {"doc": doc_id, "pg": page_no, "sec": section, "val": cas})
 
                         # Component row (name up to CAS)
                         name_part = line.split(cas)[0].strip(" ,;:-")
                         lo, hi, unit = parse_conc(line)
-                        c.execute(text("""
-                          INSERT INTO sds_component(doc_id, page_no, name, cas, cas_norm, name_key, conc_low, conc_high, conc_units)
-                          VALUES (:doc,:pg, NULLIF(:name,''), :cas, COALESCE(cas_normalize(:cas),''), lower(coalesce(:name,'')), :lo, :hi, :unit)
-                          ON CONFLICT (doc_id, cas_norm, name_key) DO NOTHING;
-                        """), {"doc": doc_id, "pg": page_no, "name": name_part, "cas": cas,
-                               "lo": lo, "hi": hi, "unit": unit})
+                        c.execute(stmt_component, {
+                            "doc": doc_id,
+                            "pg": page_no,
+                            "name": name_part,
+                            "cas": cas,
+                            "lo": lo, "hi": hi, "unit": unit
+                        })
 
                     # Hazards
                     for h in H_CODE.findall(line):
-                        c.execute(text("""
-                          INSERT INTO sds_hazard(doc_id, page_no, section, code, statement)
-                          VALUES (:doc,:pg,:sec,:code,:stmt)
-                          ON CONFLICT (doc_id, code) DO UPDATE SET statement = EXCLUDED.statement;
-                        """), {"doc": doc_id, "pg": page_no, "sec": section, "code": h, "stmt": line.strip()})
+                        c.execute(STMT_HAZARD, {
+                            "doc": doc_id, "pg": page_no, "sec": section,
+                            "code": h, "stmt": line.strip()
+                        })
                     for pcode in P_CODE.findall(line):
-                        c.execute(text("""
-                          INSERT INTO sds_hazard(doc_id, page_no, section, code, statement)
-                          VALUES (:doc,:pg,:sec,:code,:stmt)
-                          ON CONFLICT (doc_id, code) DO UPDATE SET statement = EXCLUDED.statement;
-                        """), {"doc": doc_id, "pg": page_no, "sec": section, "code": pcode, "stmt": line.strip()})
+                        c.execute(STMT_HAZARD, {"doc": doc_id, "pg": page_no, "sec": section, "code": pcode, "stmt": line.strip()})
                     for sig in SIGNAL.findall(line):
                         sigu = sig.upper()
                         c.execute(text("""
@@ -390,7 +451,8 @@ def main():
 
             print(f"[ok] stored & parsed {pdf.name} → doc_id={doc_id}, pages={len(pages)}")
 
-        # -------- after all docs: link to products + xref + registry --------
+    # -------- after all docs: link to products + xref + registry --------
+    with engine.begin() as c:
         c.execute(text(LINK_SQL))
 
         # small report
